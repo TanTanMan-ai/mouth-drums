@@ -240,6 +240,13 @@ function draw(x, hits) {
 }
 
 $("recBtn").onclick = toggleRecord;
-$("sens").oninput = convert;
+// 민감도는 한 번 맞춰두면 다음에도 그대로 쓰도록 기억한다
+const SENS_KEY = "mouthdrums-sens-v2";
+const savedSens = parseFloat(localStorage.getItem(SENS_KEY));
+if (savedSens >= 0.3 && savedSens <= 1.3) $("sens").value = savedSens;
+$("sens").oninput = () => {
+  try { localStorage.setItem(SENS_KEY, $("sens").value); } catch {}
+  convert();
+};
 window.addEventListener("resize", () => take && convert());
 renderCalList();
