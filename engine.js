@@ -1,0 +1,313 @@
+// 입드럼 -> 드럼 변환 엔진 (engine.py를 그대로 옮긴 것).
+// 온셋 감지 -> 온셋 직후 짧은 구간의 특징 추출 -> kNN 분류 -> 드럼 합성 / MIDI.
+const Engine = (() => {
+  const N_FFT = 1024;
+  const HOP = 128;
+  const MIN_GAP_MS = 60;
+  const ANALYSIS_MS = 40;
+  const N_BANDS = 24;
+  const FEAT_FFT = 2048;
+  const LABELS = ["kick", "snare", "hihat"];
+  const MIDI_NOTES = { kick: 36, snare: 38, hihat: 42 };
+
+  // ---------- FFT ----------
+  function fft(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = (-2 * Math.PI) / len;
+      const wr = Math.cos(ang), wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < len / 2; k++) {
+          const a = i + k, b = a + len / 2;
+          const xr = re[b] * cr - im[b] * ci;
+          const xi = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - xr; im[b] = im[a] - xi;
+          re[a] += xr; im[a] += xi;
+          const t = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr; cr = t;
+        }
+      }
+    }
+  }
+
+  function hann(n) {
+    const w = new Float64Array(n);
+    for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));
+    return w;
+  }
+
+  // x[start .. start+n) 에 창을 씌워 size 길이 FFT의 파워 스펙트럼을 구한다
+  function powerSpectrum(x, start, win, size) {
+    const re = new Float64Array(size), im = new Float64Array(size);
+    for (let i = 0; i < win.length; i++) {
+      const v = start + i < x.length ? x[start + i] : 0;
+      re[i] = v * win[i];
+    }
+    fft(re, im);
+    const p = new Float64Array(size / 2 + 1);
+    for (let i = 0; i < p.length; i++) p[i] = re[i] * re[i] + im[i] * im[i];
+    return p;
+  }
+
+  // ---------- 온셋 감지 ----------
+  function detectOnsets(x, sr, sensitivity = 1) {
+    if (x.length < N_FFT * 2) return [];
+    const nFrames = 1 + Math.floor((x.length - N_FFT) / HOP);
+    const win = hann(N_FFT);
+    const flux = new Float64Array(nFrames);
+    // 로그 간격 대역으로 묶어서 본다. 주파수 빈을 그대로 더하면 고역 잡음만 크게 잡히고
+    // 낮고 둥근 킥 소리("둠")는 놓친다.
+    const binHz = sr / N_FFT, ratio = Math.pow(16000 / 40, 1 / N_BANDS);
+    const edges = [];
+    for (let b = 0; b <= N_BANDS; b++) edges.push(Math.min(N_FFT / 2 + 1, Math.ceil((40 * Math.pow(ratio, b)) / binHz)));
+    const amps = [];
+    let maxAmp = 0;
+    for (let f = 0; f < nFrames; f++) {
+      const spec = powerSpectrum(x, f * HOP, win, N_FFT);
+      const a = new Float64Array(N_BANDS);
+      for (let b = 0; b < N_BANDS; b++) {
+        let s = 0;
+        for (let i = edges[b]; i < edges[b + 1]; i++) s += spec[i];
+        a[b] = Math.sqrt(s);
+        if (a[b] > maxAmp) maxAmp = a[b];
+      }
+      amps.push(a);
+    }
+    if (maxAmp <= 0) return [];
+    const floor = 0.003 * maxAmp;       // 가장 큰 소리보다 50dB 아래는 배경 잡음으로 보고 무시
+    let prev = null, maxFlux = 0;
+    for (let f = 0; f < nFrames; f++) {
+      const p = amps[f];
+      for (let b = 0; b < N_BANDS; b++) p[b] = Math.log(p[b] + floor);
+      if (prev) {
+        let s = 0;
+        for (let i = 0; i < p.length; i++) { const d = p[i] - prev[i]; if (d > 0) s += d; }
+        flux[f] = s;
+        if (s > maxFlux) maxFlux = s;
+      }
+      prev = p;
+    }
+    if (maxFlux <= 0) return [];
+
+    // 적응형 문턱값: 주변 평균 + 전체 최대값 대비 바닥
+    const w = Math.max(1, Math.floor((0.1 * sr) / HOP));
+    const half = Math.floor(w / 2);
+    const cum = new Float64Array(nFrames + 1);
+    for (let i = 0; i < nFrames; i++) cum[i + 1] = cum[i] + flux[i];
+    const minGap = Math.floor((MIN_GAP_MS / 1000) * sr);
+    const onsets = [];
+    for (let i = 1; i < nFrames - 1; i++) {
+      const lo = Math.max(0, i - half), hi = Math.min(nFrames, i - half + w);
+      const localMean = (cum[hi] - cum[lo]) / w;
+      const thresh = (1.5 * localMean + 0.12 * maxFlux) / sensitivity;
+      if (flux[i] > thresh && flux[i] >= flux[i - 1] && flux[i] > flux[i + 1]) {
+        const pos = refine(x, i * HOP + N_FFT / 2);
+        if (onsets.length && pos - onsets[onsets.length - 1] < minGap) continue;
+        onsets.push(pos);
+      }
+    }
+    return onsets;
+  }
+
+  // 프레임 단위 위치를 실제 소리가 올라오기 시작하는 샘플로 당긴다
+  function refine(x, pos) {
+    const lo = Math.max(0, pos - N_FFT / 2), hi = Math.min(x.length, pos + N_FFT / 2);
+    let peak = 0;
+    for (let i = lo; i < hi; i++) peak = Math.max(peak, Math.abs(x[i]));
+    if (peak === 0) return pos;
+    for (let i = lo; i < hi; i++) if (Math.abs(x[i]) > 0.2 * peak) return i;
+    return pos;
+  }
+
+  // ---------- 특징 추출 ----------
+  function extractFeatures(x, sr, onset, analysisMs = ANALYSIS_MS) {
+    const n = Math.min(FEAT_FFT, Math.round((analysisMs / 1000) * sr));
+    const win = hann(n);
+    const power = powerSpectrum(x, onset, win, FEAT_FFT);
+    // 앞 소리의 꼬리가 겹칠 때(킥 직후 하이햇 등)를 위해 온셋 직전 스펙트럼을 빼준다
+    const preEnd = onset - Math.floor(0.003 * sr);
+    if (preEnd - n >= 0) {
+      const pre = powerSpectrum(x, preEnd - n, win, FEAT_FFT);
+      for (let i = 0; i < power.length; i++) power[i] = Math.max(power[i] - pre[i], 0.01 * power[i]);
+    }
+    const binHz = sr / FEAT_FFT;
+    const feat = new Array(N_BANDS + 2);
+    const ratio = Math.pow(16000 / 50, 1 / N_BANDS);
+    let mean = 0;
+    for (let b = 0; b < N_BANDS; b++) {
+      const lo = 50 * Math.pow(ratio, b), hi = lo * ratio;
+      let s = 0;
+      for (let i = Math.ceil(lo / binHz); i * binHz < hi && i < power.length; i++) s += power[i];
+      feat[b] = Math.log(s + 1e-10);
+      mean += feat[b] / N_BANDS;
+    }
+    for (let b = 0; b < N_BANDS; b++) feat[b] -= mean;        // 음량에 무관하게
+    let total = 1e-10, weighted = 0;
+    for (let i = 0; i < power.length; i++) { total += power[i]; weighted += power[i] * i * binHz; }
+    feat[N_BANDS] = Math.log(weighted / total + 1);
+    let crossings = 0;
+    for (let i = onset + 1; i < onset + n && i < x.length; i++) {
+      if (Math.sign(x[i]) !== Math.sign(x[i - 1])) crossings++;
+    }
+    feat[N_BANDS + 1] = (crossings / Math.max(1, n - 1)) * 10;
+    return feat;
+  }
+
+  function peakLevel(x, sr, onset) {
+    const end = Math.min(x.length, onset + Math.floor(0.05 * sr));
+    let p = 0;
+    for (let i = onset; i < end; i++) p = Math.max(p, Math.abs(x[i]));
+    return p;
+  }
+
+  // ---------- 분류기 (사용자 캘리브레이션 기반 kNN) ----------
+  // model = { sr, analysisMs, examples: { kick: [feat...], snare: [...], hihat: [...] } }
+  function newModel(sr) {
+    return { sr, analysisMs: ANALYSIS_MS, examples: {} };
+  }
+
+  // 한 종류의 소리만 여러 번 담긴 녹음으로 그 종류를 학습. 인식한 개수를 돌려준다.
+  function learn(model, label, x, sensitivity = 1) {
+    const onsets = detectOnsets(x, model.sr, sensitivity);
+    model.examples[label] = onsets.map((o) => extractFeatures(x, model.sr, o, model.analysisMs));
+    return onsets;
+  }
+
+  function isReady(model) {
+    return !!model && LABELS.every((l) => (model.examples[l] || []).length > 0);
+  }
+
+  function makeClassifier(model) {
+    const X = [], y = [];
+    LABELS.forEach((l, li) => (model.examples[l] || []).forEach((f) => { X.push(f); y.push(li); }));
+    const dim = X[0].length;
+    const mean = new Array(dim).fill(0), std = new Array(dim).fill(0);
+    X.forEach((f) => f.forEach((v, i) => (mean[i] += v / X.length)));
+    X.forEach((f) => f.forEach((v, i) => (std[i] += (v - mean[i]) ** 2 / X.length)));
+    for (let i = 0; i < dim; i++) std[i] = Math.sqrt(std[i]) + 1e-6;
+    const norm = (f) => f.map((v, i) => (v - mean[i]) / std[i]);
+    const Xn = X.map(norm);
+    return (feat, k = 3) => {
+      const q = norm(feat);
+      const d = Xn.map((f, i) => [f.reduce((s, v, j) => s + (v - q[j]) ** 2, 0), y[i]]);
+      d.sort((a, b) => a[0] - b[0]);
+      const votes = new Array(LABELS.length).fill(0);
+      d.slice(0, k).forEach(([, li]) => votes[li]++);
+      return LABELS[votes.indexOf(Math.max(...votes))];
+    };
+  }
+
+  // ---------- 변환 ----------
+  function transcribe(x, model, sensitivity = 1) {
+    const sr = model.sr;
+    const classify = makeClassifier(model);
+    const onsets = detectOnsets(x, sr, sensitivity);
+    const levels = onsets.map((o) => peakLevel(x, sr, o));
+    const ref = Math.max(1e-9, ...levels);
+    return onsets.map((o, i) => ({
+      sample: o,
+      time: o / sr,
+      label: classify(extractFeatures(x, sr, o, model.analysisMs)),
+      velocity: Math.max(1, Math.min(127, Math.round(40 + 87 * (levels[i] / ref)))),
+    }));
+  }
+
+  // ---------- 드럼 합성 ----------
+  function synth(label, sr) {
+    if (label === "kick") {
+      const n = Math.floor(0.35 * sr), out = new Float32Array(n);
+      let phase = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        phase += (2 * Math.PI * (45 + 110 * Math.exp(-t * 35))) / sr;
+        out[i] = Math.sin(phase) * Math.exp(-t * 9);
+      }
+      return out;
+    }
+    const noise = (n) => { const a = new Float32Array(n); for (let i = 0; i < n; i++) a[i] = Math.random() * 2 - 1; return a; };
+    if (label === "snare") {
+      const n = Math.floor(0.22 * sr), out = new Float32Array(n), w = noise(n + 1);
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        out[i] = 0.5 * Math.sin(2 * Math.PI * 185 * t) * Math.exp(-t * 30)
+               + 0.6 * (w[i + 1] - w[i]) * Math.exp(-t * 22);
+      }
+      return out;
+    }
+    const n = Math.floor(0.07 * sr), out = new Float32Array(n), w = noise(n + 2);
+    for (let i = 0; i < n; i++) {
+      out[i] = 0.25 * (w[i + 2] - 2 * w[i + 1] + w[i]) * Math.exp((-i / sr) * 70);
+    }
+    return out;
+  }
+
+  function render(hits, length, sr) {
+    const sounds = {};
+    LABELS.forEach((l) => (sounds[l] = synth(l, sr)));
+    const out = new Float32Array(length + sr);
+    for (const h of hits) {
+      const s = sounds[h.label], g = h.velocity / 127;
+      for (let i = 0; i < s.length && h.sample + i < out.length; i++) out[h.sample + i] += s[i] * g;
+    }
+    return out;
+  }
+
+  // ---------- 내보내기 ----------
+  function encodeWav(x, sr) {
+    let peak = 0;
+    for (let i = 0; i < x.length; i++) peak = Math.max(peak, Math.abs(x[i]));
+    const gain = peak > 0.99 ? 0.99 / peak : 1;
+    const buf = new ArrayBuffer(44 + x.length * 2), v = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, "RIFF"); v.setUint32(4, 36 + x.length * 2, true); str(8, "WAVEfmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, x.length * 2, true);
+    for (let i = 0; i < x.length; i++) {
+      v.setInt16(44 + i * 2, Math.round(Math.max(-1, Math.min(1, x[i] * gain)) * 32767), true);
+    }
+    return buf;
+  }
+
+  // GM 드럼(채널 10) 단일 트랙 MIDI 파일
+  function encodeMidi(hits, bpm = 120) {
+    const ppq = 480, ticksPerSec = (ppq * bpm) / 60;
+    const events = [];
+    for (const h of hits) {
+      const on = Math.round(h.time * ticksPerSec), note = MIDI_NOTES[h.label];
+      events.push([on, 1, [0x99, note, h.velocity]]);
+      events.push([on + ppq / 8, 0, [0x89, note, 0]]);
+    }
+    events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const varlen = (n) => {
+      const out = [n & 0x7f];
+      while ((n >>= 7)) out.unshift((n & 0x7f) | 0x80);
+      return out;
+    };
+    const tempo = Math.round(60000000 / bpm);
+    const track = [0, 0xff, 0x51, 3, (tempo >> 16) & 255, (tempo >> 8) & 255, tempo & 255];
+    let last = 0;
+    for (const [tick, , data] of events) { track.push(...varlen(tick - last), ...data); last = tick; }
+    track.push(0, 0xff, 0x2f, 0);
+    const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+    return new Uint8Array([
+      0x4d, 0x54, 0x68, 0x64, ...u32(6), 0, 0, 0, 1, ppq >> 8, ppq & 255,
+      0x4d, 0x54, 0x72, 0x6b, ...u32(track.length), ...track,
+    ]);
+  }
+
+  return { LABELS, ANALYSIS_MS, detectOnsets, extractFeatures, newModel, learn, isReady,
+           transcribe, render, encodeWav, encodeMidi };
+})();
+
+if (typeof module !== "undefined") module.exports = Engine;

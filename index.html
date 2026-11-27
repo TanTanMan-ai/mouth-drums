@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14141a">
+<title>입드럼</title>
+<style>
+  :root { --bg:#14141a; --card:#1f1f29; --line:#2e2e3c; --text:#f2f2f5; --dim:#9a9aae;
+          --kick:#ff6b4a; --snare:#ffd23f; --hihat:#4ad6ff; --rec:#ff3b5c; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:16px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;
+         padding:20px 16px calc(40px + env(safe-area-inset-bottom)); max-width:520px; margin:0 auto; }
+  h1 { font-size:26px; margin:8px 0 2px; }
+  h2 { font-size:15px; color:var(--dim); font-weight:600; margin:28px 0 10px; }
+  p { margin:0; }
+  .sub { color:var(--dim); font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  button { font:inherit; color:inherit; border:0; cursor:pointer; }
+  button:disabled { opacity:.4; }
+
+  .cal { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+  .dot { width:12px; height:12px; border-radius:50%; flex:none; }
+  .cal .info { flex:1; min-width:0; }
+  .cal .name { font-weight:600; }
+  .cal .state { font-size:13px; color:var(--dim); }
+  .cal .state.ok { color:#7be08a; }
+  .cal .state.warn { color:var(--snare); }
+  .cal button { background:#33334a; border-radius:10px; padding:10px 14px; font-size:14px; font-weight:600; }
+
+  #overlay { position:fixed; inset:0; background:rgba(10,10,14,.94); display:none;
+             flex-direction:column; align-items:center; justify-content:center; padding:24px; text-align:center; z-index:5; }
+  #overlay.on { display:flex; }
+  #ovTitle { font-size:22px; font-weight:700; }
+  #ovHint { color:var(--dim); margin-top:6px; }
+  #ovCount { font-size:64px; font-weight:700; margin:22px 0 10px; font-variant-numeric:tabular-nums; }
+  .meter { width:min(280px,80vw); height:10px; background:#2a2a38; border-radius:5px; overflow:hidden; }
+  .meter i { display:block; height:100%; width:0; background:var(--rec); transition:width .06s linear; }
+
+  #recBtn { width:120px; height:120px; border-radius:50%; background:var(--rec); display:block; margin:6px auto 10px;
+            font-size:17px; font-weight:700; box-shadow:0 0 0 8px rgba(255,59,92,.15); }
+  #recBtn.on { border-radius:28px; animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 18px rgba(255,59,92,.08); } }
+  #recInfo { text-align:center; min-height:24px; }
+  #recMeter { margin:10px auto 0; }
+
+  #result { display:none; margin-top:14px; }
+  canvas { width:100%; height:110px; display:block; border-radius:8px; background:#17171f; }
+  .legend { display:flex; gap:14px; font-size:13px; margin:8px 0 12px; flex-wrap:wrap; }
+  .legend span { display:flex; align-items:center; gap:6px; }
+  .player { margin-top:10px; }
+  .player label { font-size:13px; color:var(--dim); display:block; margin-bottom:4px; }
+  audio { width:100%; height:40px; }
+  .row { display:flex; align-items:center; gap:10px; margin-top:14px; font-size:14px; }
+  .row input[type=range] { flex:1; }
+  .dl { display:flex; gap:8px; margin-top:14px; }
+  .dl a { flex:1; text-align:center; background:#33334a; border-radius:10px; padding:11px 0; color:inherit;
+          text-decoration:none; font-size:14px; font-weight:600; }
+  #msg { color:var(--snare); font-size:14px; margin-top:10px; text-align:center; min-height:20px; }
+  ul.tips { color:var(--dim); font-size:13px; padding-left:18px; margin:10px 0 0; }
+</style>
+</head>
+<body>
+  <h1>입드럼</h1>
+  <p class="sub">입으로 낸 비트를 드럼 소리로 바꿔줍니다.</p>
+
+  <h2>1. 내 소리 학습</h2>
+  <div class="card" id="calList"></div>
+  <ul class="tips">
+    <li>녹음 버튼을 누르고 6초 동안 그 소리만 6~8번, 또박또박 끊어서 내주세요.</li>
+    <li>조용한 곳에서, 휴대폰을 입에서 한 뼘 정도 떨어뜨리면 잘 됩니다.</li>
+  </ul>
+
+  <h2>2. 비트 녹음</h2>
+  <div class="card">
+    <button id="recBtn" disabled>녹음</button>
+    <p id="recInfo" class="sub">세 가지 소리를 먼저 학습시켜 주세요.</p>
+    <div class="meter" id="recMeter"><i></i></div>
+    <p id="msg"></p>
+
+    <div id="result">
+      <canvas id="view"></canvas>
+      <div class="legend" id="legend"></div>
+      <div class="player"><label>드럼으로 바꾼 결과</label><audio id="drumAudio" controls playsinline></audio></div>
+      <div class="player"><label>내 목소리 원본</label><audio id="voiceAudio" controls playsinline></audio></div>
+      <div class="row">
+        <span>덜 민감</span>
+        <input type="range" id="sens" min="0.4" max="2.5" step="0.1" value="1">
+        <span>더 민감</span>
+      </div>
+      <div class="dl">
+        <a id="dlWav" download="mouth-drums.wav">드럼 WAV 저장</a>
+        <a id="dlMid" download="mouth-drums.mid">MIDI 저장</a>
+      </div>
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div id="ovTitle"></div>
+    <div id="ovHint"></div>
+    <div id="ovCount"></div>
+    <div class="meter"><i id="ovMeter"></i></div>
+  </div>
+
+  <script src="engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>엔진 검증</title>
+<pre id="out">실행 중...</pre>
+<script src="engine.js"></script>
+<script>
+// test_synthetic.py와 같은 검증: 합성한 가짜 입소리로 감지/분류/렌더/MIDI가 맞물려 도는지 확인
+function runTest(SR) {
+  let seed = 1;
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const j = (lo, hi) => lo + (hi - lo) * rnd();
+
+  function mouthSound(label) {
+    let n, s;
+    if (label === "kick") {
+      n = Math.floor(j(0.10, 0.16) * SR); s = new Float32Array(n);
+      const f = j(90, 130), d = j(18, 28);
+      for (let i = 0; i < n; i++) { const t = i / SR;
+        s[i] = (Math.sin(2*Math.PI*f*t) + 0.4*Math.sin(4*Math.PI*f*t)) * Math.exp(-t*d) + 0.05*gauss()*Math.exp(-t*60); }
+    } else if (label === "snare") {
+      n = Math.floor(j(0.10, 0.18) * SR); s = new Float32Array(n);
+      const d = j(15, 25), w = Array.from({ length: n + 6 }, gauss);
+      for (let i = 0; i < n; i++) { let a = 0; for (let k = 0; k < 6; k++) a += w[i + k] / 6; s[i] = 2 * a * Math.exp(-i / SR * d); }
+    } else {
+      n = Math.floor(j(0.03, 0.06) * SR); s = new Float32Array(n);
+      const d = j(40, 70), w = Array.from({ length: n + 2 }, gauss);
+      for (let i = 0; i < n; i++) s[i] = 0.5 * (w[i+2] - 2*w[i+1] + w[i]) * Math.exp(-i / SR * d);
+    }
+    let peak = 0;
+    for (let i = 0; i < n; i++) { s[i] *= Math.min(1, i / (0.002 * SR), (n - i) / (0.005 * SR)); peak = Math.max(peak, Math.abs(s[i])); }
+    const g = j(0.5, 1.0) / peak;
+    return s.map((v) => v * g);
+  }
+  function sequence(items, length) {
+    const x = new Float32Array(Math.floor(length * SR));
+    for (let i = 0; i < x.length; i++) x[i] = 0.002 * gauss();
+    for (const [label, t] of items) { const s = mouthSound(label), o = Math.floor(t * SR); for (let i = 0; i < s.length; i++) x[o + i] += s[i]; }
+    return x;
+  }
+
+  const model = Engine.newModel(SR), counts = {};
+  for (const l of Engine.LABELS) {
+    counts[l] = Engine.learn(model, l, sequence(Array.from({ length: 8 }, (_, i) => [l, 0.3 + 0.6 * i]), 5.5)).length;
+  }
+  const bar = [["kick",0],["hihat",.25],["snare",.5],["hihat",.75],["kick",1],["kick",1.125],["hihat",1.25],["snare",1.5],["hihat",1.75]];
+  const truth = [];
+  for (let b = 0; b < 4; b++) for (const [l, t] of bar) truth.push([l, 0.2 + t + 2 * b]);
+  const x = sequence(truth, 8.6);
+  const hits = Engine.transcribe(x, model);
+
+  let matched = 0, correct = 0, worst = 0;
+  const used = new Set();
+  for (const [l, t] of truth) {
+    let best = -1, err = 0.03;
+    hits.forEach((h, i) => { const e = Math.abs(h.time - t); if (!used.has(i) && e < err) { err = e; best = i; } });
+    if (best < 0) continue;
+    used.add(best); matched++; worst = Math.max(worst, err); if (hits[best].label === l) correct++;
+  }
+  const drums = Engine.render(hits, x.length, SR);
+  const wav = new Uint8Array(Engine.encodeWav(drums, SR)), mid = Engine.encodeMidi(hits);
+  const midLen = (mid[18] << 24) | (mid[19] << 16) | (mid[20] << 8) | mid[21];
+  const filesOk = wav.length === 44 + drums.length * 2 && String.fromCharCode(...wav.slice(0, 4)) === "RIFF"
+    && String.fromCharCode(...mid.slice(0, 4)) === "MThd" && midLen === mid.length - 22
+    && drums.some((v) => Math.abs(v) > 0.1);
+  const pass = Engine.LABELS.every((l) => counts[l] === 8) && matched === truth.length
+    && hits.length === matched && correct === truth.length && filesOk;
+  return { sr: SR, pass, counts, total: truth.length, matched, correct, extra: hits.length - matched,
+           worstMs: +(worst * 1000).toFixed(1), filesOk };
+}
+window.results = [44100, 48000].map(runTest);
+document.getElementById("out").textContent = JSON.stringify(window.results, null, 2);
+</script>
