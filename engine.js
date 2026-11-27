@@ -266,6 +266,21 @@ const Engine = (() => {
     return { hits: out, step, bpm };
   }
 
+  // 입으로는 한 번에 한 소리만 낼 수 있으므로, 킥·스네어와 겹치는 하이햇은 자동으로 깔아준다.
+  // division: 4(4분음표), 8, 16. 이미 하이햇을 낸 자리는 건너뛴다.
+  function addHats(grid, division, sr) {
+    const hits = grid.hits, gap = ((60 / grid.bpm) * 4) / division;
+    const start = hits[0].time, end = hits[hits.length - 1].time;
+    const perBeat = division / 4;
+    const out = hits.slice();
+    for (let n = 0; start + n * gap <= end + gap * 0.01; n++) {
+      const t = start + n * gap;
+      if (hits.some((h) => h.label === "hihat" && Math.abs(h.time - t) < gap / 4)) continue;
+      out.push({ sample: Math.round(t * sr), time: t, label: "hihat", velocity: n % perBeat === 0 ? 85 : 60, auto: true });
+    }
+    return out.sort((a, b) => a.time - b.time);
+  }
+
   // ---------- 드럼 합성 ----------
   function synth(label, sr) {
     if (label === "kick") {
@@ -351,7 +366,7 @@ const Engine = (() => {
   }
 
   return { LABELS, ANALYSIS_MS, detectOnsets, extractFeatures, newModel, calibrationOnsets, learn, isReady,
-           transcribe, quantize, render, encodeWav, encodeMidi };
+           transcribe, quantize, addHats, render, encodeWav, encodeMidi };
 })();
 
 if (typeof module !== "undefined") module.exports = Engine;

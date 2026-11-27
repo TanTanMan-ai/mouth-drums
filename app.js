@@ -202,7 +202,9 @@ function convert() {
   }
   const found = Engine.transcribe(take.x, model, parseFloat($("sens").value));
   const grid = $("quant").checked ? Engine.quantize(found, take.sr) : null;
-  const hits = grid ? grid.hits : found;
+  const division = parseInt($("hats").value, 10);
+  $("hats").disabled = !grid;                         // 박자를 알아야 하이햇을 깔 수 있다
+  const hits = !grid ? found : division ? Engine.addHats(grid, division, take.sr) : grid.hits;
   // 박자를 맞췄으면 MIDI는 첫 소리가 첫 박에 오도록 해서 DAW 격자와 바로 맞게 한다
   const midiHits = grid ? hits.map((h) => ({ ...h, time: h.time - hits[0].time })) : hits;
   const drums = Engine.render(hits, take.x.length, take.sr);
@@ -246,6 +248,7 @@ function draw(x, hits) {
 
 $("recBtn").onclick = toggleRecord;
 $("quant").onchange = convert;
+$("hats").onchange = convert;
 // 민감도는 한 번 맞춰두면 다음에도 그대로 쓰도록 기억한다
 const SENS_KEY = "mouthdrums-sens-v2";
 const savedSens = parseFloat(localStorage.getItem(SENS_KEY));
