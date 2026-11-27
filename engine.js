@@ -233,6 +233,39 @@ const Engine = (() => {
     }));
   }
 
+  // ---------- 박자 맞추기 ----------
+  // 소리 사이 간격들이 공통으로 나누어떨어지는 가장 긴 단위(격자 한 칸)를 찾고,
+  // 각 소리를 그 격자에 붙인다. 박자를 못 찾으면 null.
+  function quantize(hits, sr) {
+    if (hits.length < 4) return null;
+    const gaps = [];
+    for (let i = 1; i < hits.length; i++) gaps.push(hits[i].time - hits[i - 1].time);
+    const score = (s) => gaps.reduce((a, d) => a + Math.cos((2 * Math.PI * d) / s), 0) / gaps.length;
+    const cands = [];
+    for (let s = 0.08; s <= 1.0; s *= 1.005) cands.push([s, score(s)]);
+    const best = Math.max(...cands.map((c) => c[1]));
+    if (best < 0.5) return null;
+    // 잘게 쪼갠 격자는 뭐든 잘 맞으므로, 충분히 잘 맞는 것 중 가장 굵은 격자를 고른다
+    let k = cands.length - 1;
+    while (cands[k][1] < 0.85 * best) k--;
+    while (k > 0 && cands[k - 1][1] > cands[k][1]) k--;
+    let step = cands[k][0];
+    const cells = gaps.map((d) => Math.max(1, Math.round(d / step)));
+    step = gaps.reduce((a, d, i) => a + d * cells[i], 0) / cells.reduce((a, n) => a + n * n, 0);
+
+    // 앞 소리와의 간격만 보고 붙이므로, 템포가 조금씩 빨라지거나 느려져도 칸을 잘못 짚지 않는다
+    let t = hits[0].time;
+    const out = hits.map((h, i) => {
+      if (i > 0) t += cells[i - 1] * step;
+      return { ...h, time: t, sample: Math.round(t * sr) };
+    });
+    let bpm = 60 / step;
+    for (const div of [1, 2, 4]) {
+      if (60 / (step * div) >= 70 && 60 / (step * div) < 140) { bpm = 60 / (step * div); break; }
+    }
+    return { hits: out, step, bpm };
+  }
+
   // ---------- 드럼 합성 ----------
   function synth(label, sr) {
     if (label === "kick") {
@@ -318,7 +351,7 @@ const Engine = (() => {
   }
 
   return { LABELS, ANALYSIS_MS, detectOnsets, extractFeatures, newModel, calibrationOnsets, learn, isReady,
-           transcribe, render, encodeWav, encodeMidi };
+           transcribe, quantize, render, encodeWav, encodeMidi };
 })();
 
 if (typeof module !== "undefined") module.exports = Engine;

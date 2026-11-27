@@ -200,7 +200,11 @@ function convert() {
     $("msg").textContent = "녹음 환경이 학습 때와 달라졌습니다. 세 가지 소리를 다시 학습시켜 주세요.";
     return;
   }
-  const hits = Engine.transcribe(take.x, model, parseFloat($("sens").value));
+  const found = Engine.transcribe(take.x, model, parseFloat($("sens").value));
+  const grid = $("quant").checked ? Engine.quantize(found, take.sr) : null;
+  const hits = grid ? grid.hits : found;
+  // 박자를 맞췄으면 MIDI는 첫 소리가 첫 박에 오도록 해서 DAW 격자와 바로 맞게 한다
+  const midiHits = grid ? hits.map((h) => ({ ...h, time: h.time - hits[0].time })) : hits;
   const drums = Engine.render(hits, take.x.length, take.sr);
 
   urls.forEach(URL.revokeObjectURL);
@@ -209,7 +213,7 @@ function convert() {
   $("drumAudio").src = drumUrl;
   $("voiceAudio").src = url(Engine.encodeWav(take.x, take.sr), "audio/wav");
   $("dlWav").href = drumUrl;
-  $("dlMid").href = url(Engine.encodeMidi(hits), "audio/midi");
+  $("dlMid").href = url(Engine.encodeMidi(midiHits, grid ? Math.round(grid.bpm) : 120), "audio/midi");
 
   $("result").style.display = "block";
   const counts = {};
@@ -217,7 +221,8 @@ function convert() {
   $("legend").innerHTML = Engine.LABELS.map((l) =>
     `<span><i class="dot" style="background:${KINDS[l].color}"></i>${KINDS[l].name} ${counts[l] || 0}</span>`).join("");
   $("recInfo").textContent = hits.length ? `${hits.length}개 소리를 찾았습니다.` : "소리를 찾지 못했습니다. 민감도를 올려보세요.";
-  draw(take.x, hits);
+  $("quantInfo").textContent = !$("quant").checked ? "" : grid ? `약 ${Math.round(grid.bpm)} BPM` : "박자를 찾지 못해 그대로 뒀어요";
+  draw(take.x, found);                    // 파형 위에는 실제로 소리가 난 위치를 표시
 }
 
 function draw(x, hits) {
@@ -240,6 +245,7 @@ function draw(x, hits) {
 }
 
 $("recBtn").onclick = toggleRecord;
+$("quant").onchange = convert;
 // 민감도는 한 번 맞춰두면 다음에도 그대로 쓰도록 기억한다
 const SENS_KEY = "mouthdrums-sens-v2";
 const savedSens = parseFloat(localStorage.getItem(SENS_KEY));
