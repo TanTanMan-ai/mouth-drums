@@ -3,7 +3,8 @@ const KINDS = {
   snare: { name: "스네어", hint: "'카', '프슈' 같은 터지는 소리", color: "#ffd23f" },
   hihat: { name: "하이햇", hint: "'츠', '칫' 같은 짧은 소리",    color: "#4ad6ff" },
 };
-const CAL_SECONDS = 6;
+const CAL_TARGET = 8;          // 종류마다 학습할 횟수
+const CAL_MAX_SECONDS = 25;
 const MAX_SECONDS = 30;
 const STORE_KEY = "mouthdrums-model-v1";
 const $ = (id) => document.getElementById(id);
@@ -53,6 +54,12 @@ async function startRecording(onLevel) {
   src.connect(node); node.connect(mute); mute.connect(ctx.destination);
   return {
     sr: ctx.sampleRate,
+    snapshot() {                                      // 녹음을 멈추지 않고 지금까지의 소리를 본다
+      const x = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
+      let o = 0;
+      for (const c of chunks) { x.set(c, o); o += c.length; }
+      return x;
+    },
     stop() {
       stream.getTracks().forEach((t) => t.stop());   // 마이크를 놓아야 재생 음량이 정상으로 돌아온다
       node.disconnect();
@@ -93,6 +100,25 @@ function renderCalList() {
   if (!recorder) $("recInfo").textContent = ready ? "버튼을 누르고 비트를 불러보세요." : "세 가지 소리를 먼저 학습시켜 주세요.";
 }
 
+// 녹음 중에 지금까지 인식한 횟수를 센다. 매번 전체를 다시 분석하면 휴대폰에서 버벅이므로,
+// 지나간 부분은 횟수만 확정해 두고 최근 몇 초만 다시 본다.
+function liveCounter(sr) {
+  let base = 0, committed = 0, maxLevel = 0;
+  return (x) => {
+    const tail = x.subarray(base);
+    const r = Engine.calibrationOnsets(tail, sr, maxLevel);
+    maxLevel = r.maxLevel;
+    const total = committed + r.onsets.length;
+    const cut = tail.length - sr;
+    // 소리 한가운데를 자르면 두 번 세거나 놓치므로, 조용한 지점일 때만 확정한다
+    if (tail.length > 3 * sr && !r.onsets.some((o) => o > cut - 0.3 * sr && o < cut + 0.1 * sr)) {
+      committed += r.onsets.filter((o) => o < cut).length;
+      base += cut;
+    }
+    return total;
+  };
+}
+
 async function calibrate(label) {
   if (recorder) return;
   const k = KINDS[label];
@@ -103,11 +129,28 @@ async function calibrate(label) {
   } catch (e) { $("msg").textContent = micError(e); return; }
   recorder = rec;
   $("ovTitle").textContent = `${k.name} 소리를 내주세요`;
-  $("ovHint").textContent = `${k.hint} · 6~8번`;
+  $("ovHint").textContent = `${k.hint} · 소리를 낼 때마다 숫자가 줄어듭니다`;
+  $("ovCount").textContent = CAL_TARGET;
+  $("ovCount").style.color = k.color;
   $("overlay").classList.add("on");
-  for (let s = CAL_SECONDS; s > 0; s--) {
-    $("ovCount").textContent = s;
-    await new Promise((r) => setTimeout(r, 1000));
+
+  // 인식한 횟수만큼 숫자를 줄이고, 다 채우면 자동으로 끝낸다
+  let stopEarly = false, shown = CAL_TARGET;
+  const count = liveCounter(rec.sr);
+  $("ovStop").onclick = () => (stopEarly = true);
+  const started = Date.now();
+  while (!stopEarly && Date.now() - started < CAL_MAX_SECONDS * 1000) {
+    await new Promise((r) => setTimeout(r, 150));
+    const left = Math.max(0, CAL_TARGET - count(rec.snapshot()));
+    if (left !== shown) {
+      shown = left;
+      $("ovCount").textContent = left;
+      $("ovCount").animate([{ transform: "scale(1.35)" }, { transform: "scale(1)" }], 180);
+    }
+    if (left === 0) {                                  // 마지막 소리의 꼬리까지 담고 끝낸다
+      await new Promise((r) => setTimeout(r, 350));
+      break;
+    }
   }
   const x = rec.stop();
   recorder = null;

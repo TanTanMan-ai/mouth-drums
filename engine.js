@@ -177,8 +177,19 @@ const Engine = (() => {
   }
 
   // 한 종류의 소리만 여러 번 담긴 녹음으로 그 종류를 학습. 인식한 개수를 돌려준다.
-  function learn(model, label, x, sensitivity = 1) {
-    const onsets = detectOnsets(x, model.sr, sensitivity);
+  // 학습용 온셋: 배경 잡음이나 숨소리가 세어지지 않도록 충분히 큰 소리만 남긴다.
+  // 녹음 도중에 반복 호출해서 "지금까지 몇 번 인식했는지"를 보여주는 데도 쓴다.
+  // refLevel: 앞 구간에서 이미 들은 가장 큰 소리 크기 (구간을 나눠 볼 때 기준을 이어가기 위함)
+  function calibrationOnsets(x, sr, refLevel = 0) {
+    const all = detectOnsets(x, sr);
+    const levels = all.map((o) => peakLevel(x, sr, o));
+    const maxLevel = Math.max(refLevel, ...levels);
+    const gate = Math.max(0.02, 0.25 * maxLevel);
+    return { onsets: all.filter((_, i) => levels[i] >= gate), maxLevel };
+  }
+
+  function learn(model, label, x) {
+    const { onsets } = calibrationOnsets(x, model.sr);
     model.examples[label] = onsets.map((o) => extractFeatures(x, model.sr, o, model.analysisMs));
     return onsets;
   }
@@ -306,7 +317,7 @@ const Engine = (() => {
     ]);
   }
 
-  return { LABELS, ANALYSIS_MS, detectOnsets, extractFeatures, newModel, learn, isReady,
+  return { LABELS, ANALYSIS_MS, detectOnsets, extractFeatures, newModel, calibrationOnsets, learn, isReady,
            transcribe, render, encodeWav, encodeMidi };
 })();
 
